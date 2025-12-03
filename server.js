@@ -8,6 +8,9 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const PORT = process.env.PORT || 3456;
 
+// Parse JSON bodies (for base64 endpoint)
+app.use(express.json({ limit: '100mb' }));
+
 // Create temp directory
 const TEMP_DIR = path.join(__dirname, 'temp');
 if (!fs.existsSync(TEMP_DIR)) {
@@ -91,6 +94,83 @@ app.post('/merge', upload.any(), async (req, res) => {
 function cleanup(files, listFile, outputFile) {
   try {
     files.forEach(f => fs.existsSync(f.path) && fs.unlinkSync(f.path));
+    fs.existsSync(listFile) && fs.unlinkSync(listFile);
+    fs.existsSync(outputFile) && fs.unlinkSync(outputFile);
+  } catch (e) {
+    console.error('Cleanup error:', e);
+  }
+}
+
+// Merge audio files from base64 JSON - works better with n8n
+app.post('/merge-base64', async (req, res) => {
+  const { audioFiles } = req.body;
+
+  if (!audioFiles || !Array.isArray(audioFiles) || audioFiles.length === 0) {
+    return res.status(400).json({ error: 'No audio files provided. Expected { audioFiles: [{ data: "base64...", index: 0 }, ...] }' });
+  }
+
+  // Sort by index
+  audioFiles.sort((a, b) => (a.index || 0) - (b.index || 0));
+
+  console.log(`Merging ${audioFiles.length} base64 audio files`);
+
+  const sessionId = uuidv4();
+  const tempFiles = [];
+  const listFile = path.join(TEMP_DIR, `${sessionId}-list.txt`);
+  const outputFile = path.join(TEMP_DIR, `${sessionId}-merged.mp3`);
+
+  try {
+    // Write base64 audio to temp files
+    for (let i = 0; i < audioFiles.length; i++) {
+      const audioData = audioFiles[i].data;
+      const tempPath = path.join(TEMP_DIR, `${sessionId}-${i}.mp3`);
+
+      // Remove data URL prefix if present
+      const base64Data = audioData.replace(/^data:audio\/\w+;base64,/, '');
+      fs.writeFileSync(tempPath, Buffer.from(base64Data, 'base64'));
+      tempFiles.push(tempPath);
+    }
+
+    // Create ffmpeg concat list
+    const fileList = tempFiles.map(f => `file '${f}'`).join('\n');
+    fs.writeFileSync(listFile, fileList);
+
+    // Run ffmpeg
+    await new Promise((resolve, reject) => {
+      exec(
+        `ffmpeg -f concat -safe 0 -i "${listFile}" -c copy "${outputFile}"`,
+        (error, stdout, stderr) => {
+          if (error) {
+            console.error('ffmpeg error:', stderr);
+            reject(error);
+          } else {
+            resolve();
+          }
+        }
+      );
+    });
+
+    // Send merged file
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', 'attachment; filename="merged-podcast.mp3"');
+
+    const readStream = fs.createReadStream(outputFile);
+    readStream.pipe(res);
+
+    readStream.on('end', () => {
+      cleanupBase64(tempFiles, listFile, outputFile);
+    });
+
+  } catch (error) {
+    console.error('Merge error:', error);
+    cleanupBase64(tempFiles, listFile, outputFile);
+    res.status(500).json({ error: 'Failed to merge audio files', details: error.message });
+  }
+});
+
+function cleanupBase64(tempFiles, listFile, outputFile) {
+  try {
+    tempFiles.forEach(f => fs.existsSync(f) && fs.unlinkSync(f));
     fs.existsSync(listFile) && fs.unlinkSync(listFile);
     fs.existsSync(outputFile) && fs.unlinkSync(outputFile);
   } catch (e) {
